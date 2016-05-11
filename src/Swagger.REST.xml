@@ -1,0 +1,362 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="25" zv="Cache for Windows (x86-64) 2015.2.2 (Build 805U)" ts="2016-05-11 15:40:04">
+<Class name="Swagger.REST">
+<Description><![CDATA[
+
+**Swagger class RESTful service** <br><br>
+
+Generate Swagger-UI JSON for all RESTful services. <br><br>
+
+Add these methods and routes to your current %CSP.REST service and it will list your RESTful services. <br>
+It examines the <Routes> in the XData UrlMap and then extracts the parameters and comments from the code to dynamically generate the swagger-ui json. <br><br>
+
+Note: The UnknownUser (or account you use on the CSP Gateway) needs access to %SYS to extract certain system information thats required. <br>
+]]></Description>
+<Super>%CSP.REST</Super>
+<TimeChanged>64049,55258.656498</TimeChanged>
+<TimeCreated>64049,54365.914465</TimeCreated>
+
+<Parameter name="Secure">
+<Description>
+REST service to accept on secure HTTPS requests?</Description>
+<Default>0</Default>
+</Parameter>
+
+<XData name="UrlMap">
+<Data><![CDATA[
+<Routes>
+<Route Url="/swagger-json" Method="GET" Call="GetSwagger" />
+</Routes>
+]]></Data>
+</XData>
+
+<Method name="jsonSwagger">
+<Description><![CDATA[
+Create JSON swagger-ui file <br><br>
+
+Use the GetSwagger method if you want a response from a RESTful service
+(called by the GetSwagger method)
+]]></Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>filename:%String=""</FormalSpec>
+<Implementation><![CDATA[
+	set schemes="http"
+	set:..#Secure schemes="https"
+	
+	set ns=$namespace // save current namespace
+	
+	set q=$char(34)  // double quote
+	set tab=$char(9) // tab
+	set tabs="",$piece(tabs,tab,20)=tab
+	set level=0
+	
+	if filename'=""	{
+		close filename
+		open filename:("WNS")
+		use filename
+	}
+	
+	write "{" // open json
+	set level=level+1,ctab=$extract(tabs,1,level)
+	
+	// json property - swagger
+	write !,ctab_q_"swagger"_q_": "_q_"2.0"_q
+	
+	// json property - info
+	write "," // next item
+	write !,ctab_q_"info"_q_": {" // open info
+	set cdef=##class(%Dictionary.ClassDefinition).%OpenId($THIS)
+	set title=cdef.Name
+	set description=cdef.Description
+	set version=""
+	for lp=1:1:$length(description,$char(13,10)) {
+		set line=$piece(description,$c(13,10),lp)
+		set version=$piece($zconvert(line,"l"),"version=",2)
+		set:version[q version=$piece(version,q,2)
+		quit:version'=""
+	}
+	set description=$zconvert( $translate(description,$char(13,10),"") ,"O","JS")
+	set:version="" version="unknown"
+	set level=level+1,ctab=$extract(tabs,1,level)
+	write !,ctab,q_"title"_q_": "_q_title_q
+	write "," // next item
+	write !,ctab,q_"description"_q_": "_q_description_q
+	write "," // next item
+	write !,ctab,q_"version"_q_": "_q_version_q
+	write !,ctab_"}" // close info
+	set level=level-1,ctab=$extract(tabs,1,level)
+	
+	// json property - host
+	// obtain web server port and hostname
+	set port=""
+	try {
+		set ok=1
+		zn "%SYS" // might not have permissions? - may get <PROTECT> error - catch will pick this up
+		set sc=##Class(Config.Startup).Get(.props)
+		zn ns
+		if props("WebServerPort")'="",props("WebServerPort")'=80 {
+			set port=":"_props("WebServerPort")
+		}
+	} catch {
+    	zn ns
+		set ok=0
+		set port=":no-port"
+	}
+	write "," // next item
+	write !,ctab_q_"host"_q_": "_q_$SYSTEM.INetInfo.LocalHostName()_port_q
+		
+	// json property - schemes
+	write "," // next item
+	write !,ctab_q_"schemes"_q_": [ "_q_schemes_q_" ]" // json array
+	
+	// json property - basePath
+	//
+    // obtain the url from the web application setup, based on the dispatch class
+	set basePath=""
+    try {
+	    set ok=1
+	    zn "%SYS" // might not have permissions? - may get <PROTECT> error - catch will pick this up
+	    // obtain a list of the web applications setup for the instance
+    	set oRS=##class(%ResultSet).%New("Security.Applications:List")
+    	set sc=oRS.Execute()
+    	kill apps
+    	while oRS.%Next() {	set apps(oRS.Data("Name"))="" }
+    	kill oRS
+	   	// obtain details for application name, does it match our RESTful displatch class?
+	   	set app=""
+	   	for  {
+		   	set app=$order(apps(app))
+		   	quit:app=""
+			set oApp=##class(Security.Applications).%OpenId(app)
+	    	if oApp.DispatchClass=$THIS,oApp.NameSpace=ns set basePath=app
+	    	kill oApp
+	    	quit:basePath'=""
+	   	}
+    	zn ns
+    	set:basePath="" basePath="/unknown"
+    } catch {
+	    // no access to %SYS
+       	zn ns
+	    set ok=0
+		set basePath="/no-base-path"
+	}
+	write "," // next item
+	write !,ctab_q_"basePath"_q_": "_q_basePath_q
+	
+	// json property - paths
+	write "," // next item
+	write !,ctab_q_"paths"_q_": {"
+	set level=level+1,ctab=$extract(tabs,1,level)
+	// get the route map from the REST class
+	set xdataID = $THIS_"||UrlMap"
+    set compiledXdata = ##class(%Dictionary.CompiledXData).%OpenId(xdataID)
+    set tStream = compiledXdata.Data
+    do ##class(%XML.TextReader).ParseStream(tStream,.textreader) // use the XML parser
+    
+    // go through each route and collect paths for swagger
+    set cnt=0
+    while textreader.Read() {
+    	continue:'textreader.MoveToAttributeName("Method")
+    	set method=$zconvert(textreader.Value, "l") // http method - i.e. get/post/delete (lowercase)
+    	// check if the method call matches the method name passed in
+    	continue:'textreader.MoveToAttributeName("Call")
+    	set call=textreader.Value // called method
+	   	continue:'textreader.MoveToAttributeName("Url")
+    	set url=textreader.Value // mapped url
+    	set newurl="",urlParam=""
+    	for lp=1:1:$length(url,"/") {
+	    	set urlbit=$piece(url,"/",lp)
+	    	if $extract(urlbit,1,1)=":" {
+		    	// swagger url parameter conversion
+		    	set urlParam=urlParam_$listbuild( $extract(urlbit,2,$length(urlbit)) )
+		    	set urlbit="{"_$extract(urlbit,2,$length(urlbit))_"}"
+	    	}
+	    	set:urlbit'="" newurl=newurl_"/"_urlbit
+    	}
+    	set url=newurl
+    	set summary=""
+    	// obtain method summary
+    	set oM=##class(%Dictionary.MethodDefinition).%OpenId($THIS_"||"_call)
+    	set summary=$piece(oM.Description,$char(13,10),1) // first line from description is summary
+    	set summary=$zconvert(summary, "O", "JS")
+    	set paths(url,method,"summary")=summary
+	   	set description=$piece(oM.Description, $char(13,10), 2, 21) // the next 20 lines make the description
+    	// convert any string?
+    	set convert("[")="&#91;"
+    	set convert("]")="&#93;"
+    	set convert("{")="&#123;"
+    	set convert("}")="&#125;"
+    	set strFrom=""
+    	for  {
+	    	quit  // conversion not needed at present as it was single quotes causing issues, left code for future use if needed
+	    	set strFrom=$order(convert(strFrom))
+	    	quit:strFrom=""
+	    	set newDesc=""
+	    	for lp=1:1:$length(description, strFrom) {
+		    	set piece=$piece(description, strFrom, lp)
+		    	set:newDesc'="" newDesc=newDesc_convert(strFrom)
+		    	set newDesc=newDesc_piece
+	    	}
+	    	set description=newDesc
+    	}
+    	set description=$translate(description,"'",q) // swagger does not like single quotes, convert to double
+    	set description=$zconvert( $translate(description, $char(13,10),"") ,"O","JS")
+    	set:description="" description="No description available"
+    	set paths(url,method,"description")=description
+    	set parameters=oM.FormalSpec // parameters in format param1:%String="default",param2:%Integer ...etc...
+    	if parameters'="" {
+	    	for lp=1:1:$length(parameters,",") {
+		    	set parameter=$piece(parameters,",",lp)
+	    		set type=$zconvert( $piece($piece(parameter,":",2),"=",1), "l") // lowercase
+	    		set type=$translate(type,"%","") // remove % - most types match
+	    		set format=""
+	    		// convert cache data types to swagger data types
+	    		set ok=0
+	    		set:type="integer" format="int32",ok=1
+	    		set:type="bigint" type="integer",format="int64",ok=1
+	    		set:type="char" type="string",ok=1
+	    		set:type="decimal" type="number",format="float",ok=1
+	    		set:type="float" type="number",format="float",ok=1
+	    		set:type="double" type="number",format="double",ok=1
+	    		set:type="date" type="string",ok=1 // horolog date
+	    		set:type="datetime" type="string",ok=1 // horolog date
+	    		set:type="binary" type="string",format="binary",ok=1
+	    		set:type="exactstring" type="string",ok=1
+	    		set:type="boolean" ok=1
+	    		if 'ok set type="string" // default data type
+	    		set paths(url,method,"parameter",lp)=$listbuild($listget(urlParam,lp), $zconvert(parameter,"O","JS"), type, format)
+    		}
+    	}
+    }
+    // go through url paths and output json
+    set firstPath=1
+    set url=""
+    for  {
+	    set url=$order(paths(url))
+	    quit:url=""
+	    
+	    write:'firstPath ","
+	    set firstPath=0
+	    write !,ctab,q_url_q_": {" // url json object
+	    set level=level+1,ctab=$extract(tabs,1,level)
+	    
+	    set firstMethod=1
+	    set method=""
+	    for  {
+	    	set method=$order(paths(url,method))
+	    	quit:method=""
+    		write:'firstMethod ","
+    		set firstMethod=0
+    	   	write !,ctab,q_method_q_": {" // http method json object
+    		set level=level+1,ctab=$extract(tabs,1,level)
+    		set summary=""
+    		// obtain method summary
+    		write !,ctab,q_"summary"_q_": "_q_paths(url,method,"summary")_q
+    		write ","
+    		write !,ctab,q_"description"_q_": "_q_paths(url,method,"description")_q
+    		// tags
+    		set tags=$piece(url,"/",2) // take first part of url as tag
+    		write ","
+    		write !,ctab,q_"tags"_q_": [ "_q_tags_q_" ]"
+    		// parameters
+    		if $order(paths(url,method,"parameter",""))'="" {
+    			write ","
+    			write !,ctab,q_"parameters"_q_": "
+    			set level=level+1,ctab=$extract(tabs,1,level)
+    			write !,ctab,"[" // parameters array
+    			set firstParam=1
+    			set paramNo=""
+    			for  {
+	    			set paramNo=$order(paths(url,method,"parameter",paramNo))
+	    			quit:paramNo=""
+	    			// paths(url,method,"parameter",paramNo)=$listbuild(urlParam, parameter, type, format)
+	    			set paramData=paths(url,method,"parameter",paramNo)
+	    			if $listget(paramData,1)'="" {
+	    				write:'firstParam ","
+		    			set firstParam=0
+		    			set level=level+1,ctab=$extract(tabs,1,level)
+		    			write !,ctab,"{"
+    					write !,ctab,q_"name"_q_": "_q_$listget(paramData,1)_q // urlParam found when getting service url path
+    					write ","
+    					write !,ctab,q_"in"_q_": "_q_"path"_q // our RESTful services have params on the path
+    					write ","
+    					write !,ctab,q_"description"_q_": "_q_$listget(paramData,2)_q // use cache FormalSpec as description
+	   					write ","
+    					write !,ctab,q_"required"_q_": "_q_"true"_q // always true as we use URL restful service parameters
+    					write ","
+    					write !,ctab,q_"type"_q_": "_q_$listget(paramData,3)_q
+    					write ","
+    					write !,ctab,q_"format"_q_": "_q_$listget(paramData,4)_q
+		    			write !,ctab,"}"
+		    			set level=level-1,ctab=$extract(tabs,1,level)
+	    			}
+    			}
+    			write !,ctab,"]" // end of parameters array
+    			set level=level-1,ctab=$extract(tabs,1,level)
+    		}
+    		// responses - describe an arbitary JSON object response
+    		write ","
+    		write !,ctab,q_"responses"_q_": "
+    		set level=level+1,ctab=$extract(tabs,1,level)
+    		write !,ctab,"{"
+    		write !,ctab,q_"200"_q_": "
+    		set level=level+1,ctab=$extract(tabs,1,level)
+    		write !,ctab,"{"
+    		write !,ctab,q_"description"_q_": "_q_"A simple string response"_q
+    		write ","
+    		write !,ctab,q_"schema"_q_": { "_q_"type"_q_": "_q_"string"_q_" }"
+    		write !,ctab,"}" ;_" <-- end of 200"
+    		set level=level-1,ctab=$extract(tabs,1,level)
+    		write !,ctab,"}" ;_" <-- end of response"
+    		set level=level-1,ctab=$extract(tabs,1,level)
+
+    		write !,ctab,"}" ;_" <-- end of method "_method
+    		set level=level-1,ctab=$extract(tabs,1,level)
+	    }
+    	write !,ctab,"}" ;_" <-- end of url "_url
+    	set level=level-1,ctab=$extract(tabs,1,level)
+    }
+
+    write !,ctab,"}" ;_" <-- end of paths"
+    set level=level-1,ctab=$extract(tabs,1,level)
+    
+	// json property - produces
+	write "," // next item
+	write !,ctab_q_"produces"_q_": "_q_"application/json"_q
+
+    write !,"}" // close json
+    
+    if filename'="" {
+	    close filename
+	    use 0
+    }
+]]></Implementation>
+</Method>
+
+<Method name="GetSwagger">
+<Description><![CDATA[
+Return JSON data for swagger-ui <br><br>
+
+via a RESTful service... that documents itself &#9786;
+]]></Description>
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	try {
+		set %response.ContentType="application/json"
+		// (CORS headers if needed)
+		;set origin=$get(%request.CgiEnvs("HTTP_ORIGIN"))
+		;set:origin="" origin="*"
+		;do %response.SetHeader("Access-Control-Allow-Origin",origin)
+		;do %response.SetHeader("Access-Control-Allow-Methods","POST, GET, DELETE, PUT, OPTIONS")
+		;do %response.SetHeader("Access-Control-Allow-Headers","Content-Type, api_key, Authorization, x-requested-with, Total-Count, Total-Pages, Error-Message")
+		;do %response.SetHeader("Access-Control-Max-Age","1800")
+	} catch {}
+
+	do ..jsonSwagger() // output swagger json to terminal
+
+	quit $$$OK
+]]></Implementation>
+</Method>
+</Class>
+</Export>
